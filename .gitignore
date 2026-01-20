@@ -1,0 +1,10 @@
+build/
+out/
+.vscode/
+.vs/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.user
+Thumbs.db
+Desktop.ini
