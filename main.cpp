@@ -8,20 +8,13 @@
 #include <chrono>
 #include <fstream>
 #include <sstream>
-#include <cstring> // for memcpy
-
-// ==========================================
-// FORCE DISCRETE GPU (NVIDIA / AMD)
-// ==========================================
-extern "C" {
-    __declspec(dllexport) unsigned long NvOptimusEnablement = 1;
-    __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
-}
+#include <cstring>
 
 const int WIDTH = 1024;
 const int SIZE = WIDTH * WIDTH;
 const size_t BYTES = SIZE * sizeof(float);
 
+// --- Utils ---
 std::string loadFile(const char* filename) {
     std::ifstream file(filename);
     if (!file) return "";
@@ -30,11 +23,10 @@ std::string loadFile(const char* filename) {
     return buffer.str();
 }
 
-// 1. OpenGL Implementation
+// 1. OpenGL Implementation (Context Dependent)
 double run_opengl(const std::vector<float>& A, const std::vector<float>& B, std::vector<float>& C) {
-    // Check which GPU is running
     const GLubyte* renderer = glGetString(GL_RENDERER);
-    std::cout << "   OpenGL Device: " << (renderer ? (const char*)renderer : "Unknown") << std::endl;
+    std::cout << ">> OpenGL Device: " << (renderer ? (const char*)renderer : "Unknown") << std::endl;
 
     std::string sourceStr = loadFile("compute.glsl");
     const char* src = sourceStr.c_str();
@@ -42,13 +34,13 @@ double run_opengl(const std::vector<float>& A, const std::vector<float>& B, std:
     glShaderSource(shader, 1, &src, NULL);
     glCompileShader(shader);
     
-    // Quick error check
     GLint success;
     glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
     if (!success) {
         char infoLog[512];
         glGetShaderInfoLog(shader, 512, NULL, infoLog);
-        std::cout << "   [GL Error] Shader Compilation:\n" << infoLog << std::endl;
+        std::cerr << "Shader Error: " << infoLog << std::endl;
+        return -1.0;
     }
 
     GLuint program = glCreateProgram();
@@ -56,22 +48,22 @@ double run_opengl(const std::vector<float>& A, const std::vector<float>& B, std:
     glLinkProgram(program);
     glUseProgram(program);
 
-    GLuint ssboA, ssboB, ssboC;
-    glGenBuffers(1, &ssboA); glGenBuffers(1, &ssboB); glGenBuffers(1, &ssboC);
+    GLuint ssbo[3];
+    glGenBuffers(3, ssbo);
 
     auto t1 = std::chrono::high_resolution_clock::now();
 
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboA);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[0]);
     glBufferData(GL_SHADER_STORAGE_BUFFER, BYTES, A.data(), GL_STATIC_DRAW);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssboA);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo[0]);
 
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboB);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[1]);
     glBufferData(GL_SHADER_STORAGE_BUFFER, BYTES, B.data(), GL_STATIC_DRAW);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssboB);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssbo[1]);
 
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssboC);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[2]);
     glBufferData(GL_SHADER_STORAGE_BUFFER, BYTES, NULL, GL_DYNAMIC_COPY);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ssboC);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ssbo[2]);
 
     glUniform1i(glGetUniformLocation(program, "WIDTH"), WIDTH);
     glDispatchCompute(WIDTH / 32, WIDTH / 32, 1);
@@ -83,33 +75,40 @@ double run_opengl(const std::vector<float>& A, const std::vector<float>& B, std:
 
     auto t2 = std::chrono::high_resolution_clock::now();
     
-    glDeleteBuffers(1, &ssboA); glDeleteBuffers(1, &ssboB); glDeleteBuffers(1, &ssboC);
+    glDeleteBuffers(3, ssbo);
     glDeleteProgram(program);
     glDeleteShader(shader);
 
     return std::chrono::duration<double, std::milli>(t2 - t1).count();
 }
 
-// 2. OpenCL Implementation
-double run_opencl(const std::vector<float>& A, const std::vector<float>& B, std::vector<float>& C) {
+// 2. OpenCL Implementation (Specific Device)
+double run_opencl_device(cl_device_id device, const std::vector<float>& A, const std::vector<float>& B, std::vector<float>& C) {
     cl_int err;
-    cl_platform_id platform;
-    clGetPlatformIDs(1, &platform, NULL);
-    cl_device_id device;
-    clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, NULL);
-
     char name[128];
     clGetDeviceInfo(device, CL_DEVICE_NAME, 128, name, NULL);
-    std::cout << "   OpenCL Device: " << name << std::endl;
+    std::cout << ">> OpenCL Device: " << name << std::endl;
 
     cl_context context = clCreateContext(NULL, 1, &device, NULL, NULL, &err);
+    if(err != CL_SUCCESS) { std::cerr << "Context Error" << std::endl; return -1.0; }
+    
     cl_command_queue queue = clCreateCommandQueueWithProperties(context, device, 0, &err);
 
     std::string sourceStr = loadFile("compute.cl");
     const char* src = sourceStr.c_str();
     size_t len = sourceStr.length();
     cl_program program = clCreateProgramWithSource(context, 1, &src, &len, &err);
-    clBuildProgram(program, 1, &device, NULL, NULL, NULL);
+    
+    err = clBuildProgram(program, 1, &device, NULL, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        size_t log_size;
+        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
+        std::vector<char> log(log_size);
+        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, log_size, log.data(), NULL);
+        std::cerr << "CL Build Error: " << log.data() << std::endl;
+        return -1.0;
+    }
+
     cl_kernel kernel = clCreateKernel(program, "matrix_mul", &err);
 
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -125,7 +124,10 @@ double run_opencl(const std::vector<float>& A, const std::vector<float>& B, std:
 
     size_t globalSize[2] = { (size_t)WIDTH, (size_t)WIDTH };
     size_t localSize[2] = { 32, 32 };
-    clEnqueueNDRangeKernel(queue, kernel, 2, NULL, globalSize, localSize, 0, NULL, NULL);
+    
+    err = clEnqueueNDRangeKernel(queue, kernel, 2, NULL, globalSize, localSize, 0, NULL, NULL);
+    if(err != CL_SUCCESS) { std::cerr << "Execute Error: " << err << std::endl; }
+    
     clEnqueueReadBuffer(queue, bufC, CL_TRUE, 0, BYTES, C.data(), 0, NULL, NULL);
 
     auto t2 = std::chrono::high_resolution_clock::now();
@@ -138,33 +140,45 @@ double run_opencl(const std::vector<float>& A, const std::vector<float>& B, std:
 }
 
 int main() {
-    std::cout << "Matrix: " << WIDTH << "x" << WIDTH << std::endl;
+    std::cout << "Benchmarking " << WIDTH << "x" << WIDTH << " Matrix Mul" << std::endl;
+    std::cout << "========================================" << std::endl;
+
     std::vector<float> A(SIZE, 1.0f);
     std::vector<float> B(SIZE, 1.0f);
-    std::vector<float> C_GL(SIZE);
-    std::vector<float> C_CL(SIZE);
+    std::vector<float> C(SIZE);
 
-    // Init OpenGL
+    // --- 1. RUN OPENGL (Current Context) ---
     if (!glfwInit()) return -1;
     glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
     GLFWwindow* window = glfwCreateWindow(640, 480, "Hidden", NULL, NULL);
     glfwMakeContextCurrent(window);
-    gladLoadGLLoader((GLADloadproc)glfwGetProcAddress);
+    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) return -1;
 
-    std::cout << "Starting OpenGL..." << std::endl;
-    double timeGL = run_opengl(A, B, C_GL);
-    std::cout << "   Time: " << timeGL << " ms" << std::endl;
+    double glTime = run_opengl(A, B, C);
+    std::cout << "   Time: " << glTime << " ms" << std::endl;
+    glfwTerminate();
 
-    glfwTerminate(); 
+    std::cout << "----------------------------------------" << std::endl;
 
-    // Init OpenCL
-    std::cout << "Starting OpenCL..." << std::endl;
-    double timeCL = run_opencl(A, B, C_CL);
-    std::cout << "   Time: " << timeCL << " ms" << std::endl;
+    // --- 2. RUN OPENCL (Iterate ALL Platforms & Devices) ---
+    cl_uint numPlatforms;
+    clGetPlatformIDs(0, NULL, &numPlatforms);
+    std::vector<cl_platform_id> platforms(numPlatforms);
+    clGetPlatformIDs(numPlatforms, platforms.data(), NULL);
 
-    std::cout << "---------------------------------" << std::endl;
-    if (timeGL < timeCL) std::cout << "Winner: OpenGL (" << timeCL/timeGL << "x faster)" << std::endl;
-    else                 std::cout << "Winner: OpenCL (" << timeGL/timeCL << "x faster)" << std::endl;
+    for (const auto& platform : platforms) {
+        cl_uint numDevices;
+        clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 0, NULL, &numDevices);
+        std::vector<cl_device_id> devices(numDevices);
+        clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, numDevices, devices.data(), NULL);
+
+        for (const auto& device : devices) {
+            double clTime = run_opencl_device(device, A, B, C);
+            std::cout << "   Time: " << clTime << " ms" << std::endl;
+            std::cout << "   Speedup vs GL (Current): " << glTime / clTime << "x" << std::endl;
+            std::cout << "----------------------------------------" << std::endl;
+        }
+    }
 
     return 0;
 }
