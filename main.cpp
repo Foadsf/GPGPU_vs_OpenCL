@@ -23,7 +23,7 @@ std::string loadFile(const char* filename) {
     return buffer.str();
 }
 
-// 1. OpenGL Implementation (Context Dependent)
+// 1. OpenGL Implementation
 double run_opengl(const std::vector<float>& A, const std::vector<float>& B, std::vector<float>& C) {
     const GLubyte* renderer = glGetString(GL_RENDERER);
     std::cout << ">> OpenGL Device: " << (renderer ? (const char*)renderer : "Unknown") << std::endl;
@@ -82,17 +82,24 @@ double run_opengl(const std::vector<float>& A, const std::vector<float>& B, std:
     return std::chrono::duration<double, std::milli>(t2 - t1).count();
 }
 
-// 2. OpenCL Implementation (Specific Device)
+// 2. OpenCL Implementation
 double run_opencl_device(cl_device_id device, const std::vector<float>& A, const std::vector<float>& B, std::vector<float>& C) {
     cl_int err;
     char name[128];
-    clGetDeviceInfo(device, CL_DEVICE_NAME, 128, name, NULL);
+    if (clGetDeviceInfo(device, CL_DEVICE_NAME, 128, name, NULL) != CL_SUCCESS) {
+        strcpy(name, "Unknown Device");
+    }
     std::cout << ">> OpenCL Device: " << name << std::endl;
 
     cl_context context = clCreateContext(NULL, 1, &device, NULL, NULL, &err);
-    if(err != CL_SUCCESS) { std::cerr << "Context Error" << std::endl; return -1.0; }
+    if(err != CL_SUCCESS) { std::cerr << "   Context Error (" << err << ")" << std::endl; return -1.0; }
     
     cl_command_queue queue = clCreateCommandQueueWithProperties(context, device, 0, &err);
+    if(err != CL_SUCCESS) { 
+        std::cerr << "   Queue Error (" << err << ")" << std::endl;
+        clReleaseContext(context);
+        return -1.0;
+    }
 
     std::string sourceStr = loadFile("compute.cl");
     const char* src = sourceStr.c_str();
@@ -105,13 +112,27 @@ double run_opencl_device(cl_device_id device, const std::vector<float>& A, const
         clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
         std::vector<char> log(log_size);
         clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, log_size, log.data(), NULL);
-        std::cerr << "CL Build Error: " << log.data() << std::endl;
+        std::cerr << "   CL Build Error: " << log.data() << std::endl;
+        clReleaseProgram(program);
+        clReleaseCommandQueue(queue);
+        clReleaseContext(context);
         return -1.0;
     }
 
     cl_kernel kernel = clCreateKernel(program, "matrix_mul", &err);
 
     auto t1 = std::chrono::high_resolution_clock::now();
+
+    // Query device limits to set appropriate local work size
+    size_t maxWorkGroupSize;
+    clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(size_t), &maxWorkGroupSize, NULL);
+    
+    // Calculate optimal local size that fits within device limits
+    size_t localDim = 32;
+    while (localDim * localDim > maxWorkGroupSize && localDim > 1) {
+        localDim /= 2;
+    }
+    std::cout << "   Local work size: " << localDim << "x" << localDim << " (max WG: " << maxWorkGroupSize << ")" << std::endl;
 
     cl_mem bufA = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, BYTES, (void*)A.data(), &err);
     cl_mem bufB = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, BYTES, (void*)B.data(), &err);
@@ -123,10 +144,17 @@ double run_opencl_device(cl_device_id device, const std::vector<float>& A, const
     clSetKernelArg(kernel, 3, sizeof(int), &WIDTH);
 
     size_t globalSize[2] = { (size_t)WIDTH, (size_t)WIDTH };
-    size_t localSize[2] = { 32, 32 };
+    size_t localSize[2] = { localDim, localDim };
     
     err = clEnqueueNDRangeKernel(queue, kernel, 2, NULL, globalSize, localSize, 0, NULL, NULL);
-    if(err != CL_SUCCESS) { std::cerr << "Execute Error: " << err << std::endl; }
+    if(err != CL_SUCCESS) { 
+        std::cerr << "   Execute Error: " << err << " (Driver Malfunction)" << std::endl; 
+        // Cleanup to prevent leaks even on failure
+        clReleaseMemObject(bufA); clReleaseMemObject(bufB); clReleaseMemObject(bufC);
+        clReleaseKernel(kernel); clReleaseProgram(program);
+        clReleaseCommandQueue(queue); clReleaseContext(context);
+        return -1.0;
+    }
     
     clEnqueueReadBuffer(queue, bufC, CL_TRUE, 0, BYTES, C.data(), 0, NULL, NULL);
 
@@ -147,7 +175,7 @@ int main() {
     std::vector<float> B(SIZE, 1.0f);
     std::vector<float> C(SIZE);
 
-    // --- 1. RUN OPENGL (Current Context) ---
+    // --- 1. RUN OPENGL ---
     if (!glfwInit()) return -1;
     glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
     GLFWwindow* window = glfwCreateWindow(640, 480, "Hidden", NULL, NULL);
@@ -160,22 +188,28 @@ int main() {
 
     std::cout << "----------------------------------------" << std::endl;
 
-    // --- 2. RUN OPENCL (Iterate ALL Platforms & Devices) ---
-    cl_uint numPlatforms;
+    // --- 2. RUN OPENCL ---
+    cl_uint numPlatforms = 0;
     clGetPlatformIDs(0, NULL, &numPlatforms);
     std::vector<cl_platform_id> platforms(numPlatforms);
     clGetPlatformIDs(numPlatforms, platforms.data(), NULL);
 
     for (const auto& platform : platforms) {
-        cl_uint numDevices;
-        clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 0, NULL, &numDevices);
+        cl_uint numDevices = 0;
+        cl_int err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 0, NULL, &numDevices);
+        
+        // Skip platforms that have 0 devices or return errors
+        if (err != CL_SUCCESS || numDevices == 0) continue;
+
         std::vector<cl_device_id> devices(numDevices);
         clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, numDevices, devices.data(), NULL);
 
         for (const auto& device : devices) {
             double clTime = run_opencl_device(device, A, B, C);
-            std::cout << "   Time: " << clTime << " ms" << std::endl;
-            std::cout << "   Speedup vs GL (Current): " << glTime / clTime << "x" << std::endl;
+            if (clTime > 0) {
+                std::cout << "   Time: " << clTime << " ms" << std::endl;
+                std::cout << "   Speedup vs GL (Current): " << glTime / clTime << "x" << std::endl;
+            }
             std::cout << "----------------------------------------" << std::endl;
         }
     }
